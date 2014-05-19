@@ -68,9 +68,11 @@ use lib "$Bin";
 use List::Util qw[min max];
 use Pod::Usage;
 use Sys::Hostname;              # provides hostname()
+use Try::Tiny;
+
 use AssemblyMapper::Support;
 use Bio::Vega::DBSQL::DBAdaptor;
-use Bio::Vega::ContigLockBroker;
+use Bio::Vega::SliceLockBroker;
 use Bio::Vega::Author;
 use Bio::EnsEMBL::Utils::Exception qw(throw warning);
 
@@ -273,28 +275,49 @@ sub do_transfer_anno {
     $sth_attrib_type_insert->execute($ref_seq_region_id) unless $ref_attrib_set;
 
     # Lock the reference and alternative assemblies
-    my ($cb,$author_obj);
-    my $slices = [$ref_sl,$alt_sl];
+    my $R_broker;
     if($write_db){
-        eval {
-            $cb = Bio::Vega::ContigLockBroker->new(-hostname => hostname);
-            $author_obj = Bio::Vega::Author->new(-name => $author, -email => $email);
-            $support->log_verbose("Locking $R_chr and $A_chr\n");
-            $cb->lock_clones_by_slice($slices,$author_obj,$R_dba);
-        };
-        if($@){
-            warning("Cannot lock assemblies $R_chr and $A_chr with author name $author\n$@\n");
+        my $author_obj = Bio::Vega::Author->new(-name => $author, -email => $email);
+        $R_broker = Bio::Vega::SliceLockBroker->new
+          (-hostname => hostname, -author => $author_obj, -adaptor => $R_dba);
+        $support->log_verbose("Locking $R_chr and $A_chr\n");
 
-                $sth_cs->execute( $A_chr, $support->param('altassembly') )
+        my $ok = try {
+            $R_broker->lock_create_for_Slice
+              (-intent => 'transfer_annotation.pl',
+               -slice => $ref_sl);
+            $R_broker->lock_create_for_Slice
+              (-intent => 'transfer_annotation.pl',
+               # alt_sl must be in same database, else broker will fail.
+               # It knows that it doesn't do two phase commits.
+               -slice => $alt_sl);
+
+            # Use broker to get the locks, then step outside broker
+            # because code here will not fit inside it without heavy
+            # refactoring.
+            $R_broker->exclusive_work(sub {}, 0); # get lock, do nothing
+
+            # Transaction during which our locks are active
+            $dbh->begin_work;
+            foreach my $lock ($R_broker->locks) {
+                $lock->bump_activity;
+            }
+            1;
+        } catch {
+            warning("Cannot lock assemblies $R_chr and $A_chr with author name $author\n$_\n");
+
+            $sth_cs->execute( $A_chr, $support->param('altassembly') )
               unless ( !$cs_change );
             $sth_attrib_type_delete->execute($alt_seq_region_id) unless $alt_attrib_set;
             $sth_attrib_type_delete->execute($ref_seq_region_id) unless $ref_attrib_set;
-
-                return;
-        }
+            $R_broker->unlock_all; # warns on failure
+            0;
+        };
+        return unless $ok;
+    } else {
+        # Transaction for dry-run
+        $dbh->begin_work;
     }
-
-    $dbh->begin_work;
 
     eval {
         $support->log_verbose("Annotation transfer $R_chr => $A_chr...\n");
@@ -587,7 +610,11 @@ sub do_transfer_anno {
         # save polyA features
         $sfeat_Ad->store(@proj_feat) if @proj_feat;
 
-        $write_db ? $dbh->commit : $dbh->rollback;
+        if ($write_db) {
+            $dbh->commit;
+        } else {
+            $dbh->rollback;
+        }
     };
 
     if ($@) {
@@ -617,14 +644,9 @@ INFO: skipped PolyA features: %d/%d\n",
         );
     }
     if($write_db){
-    # remove the assemblies locks
-        eval {
-            $support->log_verbose("Removing $R_chr and $A_chr Locks\n");
-            $cb->remove_by_slice($slices,$author_obj,$R_dba);
-        };
-        if($@){
-            warning("Cannot remove locks from assemblies $R_chr and $A_chr with author name $author\n$@\n");
-        }
+        # remove the assemblies locks
+        $support->log_verbose("Removing $R_chr and $A_chr Locks\n");
+        $R_broker->unlock_all; # does COMMIT, will warn if unlocks fail
     }
 
     $sth_cs->execute( $A_chr, $support->param('altassembly') )
